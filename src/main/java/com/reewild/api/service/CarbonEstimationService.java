@@ -173,7 +173,7 @@ public class CarbonEstimationService {
   }
  }
 
- // ---------- Helpers ----------
+
 
  private List<String> extractStringArrayFromResponse(String raw) throws Exception {
   // 1) Parse whole JSON and try to navigate to the content
@@ -186,7 +186,7 @@ public class CarbonEstimationService {
    if (!arr.isEmpty()) return arr;
   }
 
-  // 2) As a fallback, regex the first [...] block and parse it
+
   String rawText = contentNode.isMissingNode() ? raw : contentNode.asText();
   Pattern p = Pattern.compile("\\[(?s).*?\\]");
   Matcher m = p.matcher(rawText);
@@ -196,7 +196,7 @@ public class CarbonEstimationService {
    if (!arr.isEmpty()) return arr;
   }
 
-  // 3) Last resort: make a single-item guess to avoid hard failure
+
   return List.of("rice");
  }
 
