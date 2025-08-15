@@ -1,30 +1,40 @@
 package com.reewild.api.service;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Service;
-import org.springframework.web.reactive.function.client.WebClient;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.reewild.api.dto.CarbonEstimateResponse;
+import com.reewild.api.dto.Ingredient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 
 import java.util.*;
-import java.util.Base64;
-
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class CarbonEstimationService {
 
  private static final Logger log = LoggerFactory.getLogger(CarbonEstimationService.class);
 
- @Autowired
- private WebClient openAIClient;
-
- @Autowired
- private com.fasterxml.jackson.databind.ObjectMapper objectMapper;
+ private final WebClient openAIClient;
+ private final ObjectMapper objectMapper;
 
  @Value("${openai.model}")
  private String model;
+
+ @Value("${openai.vision-model:gpt-4o}")
+ private String visionModel;
+
+ public CarbonEstimationService(WebClient openAIClient, ObjectMapper objectMapper) {
+  this.openAIClient = openAIClient;
+  this.objectMapper = objectMapper;
+ }
 
  // Mock carbon database: ingredient → kg CO₂ per typical serving
  private static final Map<String, Double> CARBON_DB = Map.ofEntries(
@@ -50,160 +60,177 @@ public class CarbonEstimationService {
       Map.entry("lentils", 0.2)
  );
 
-
- public Map<String, Object> estimateFromDishName(String dishName) {
-  String prompt = String.format(
-       "List the main ingredients in '%s' as a JSON array of strings. " +
-            "Only return the JSON array, no extra text. Example: [\"rice\", \"chicken\", \"spices\"]",
-       dishName
-  );
+ public CarbonEstimateResponse estimateFromDishName(String dishName) {
+  String prompt = """
+                You are a strict JSON generator.
+                Given a dish name, return ONLY a JSON array of its likely main ingredients (strings).
+                No prose, no backticks, no explanations.
+                Example output: ["rice","chicken","spices"]
+                Dish: %s
+                """.formatted(dishName);
 
   try {
    log.info("Calling OpenAI to infer ingredients for dish: {}", dishName);
 
-   String response = openAIClient.post()
+   String raw = openAIClient.post()
         .uri("/chat/completions")
         .bodyValue(Map.of(
              "model", model,
-             "messages", List.of(
-                  Map.of("role", "user", "content", prompt)
-             ),
-             "max_tokens", 200
+             "messages", List.of(Map.of("role", "user", "content", prompt)),
+             "max_tokens", 200,
+             "temperature", 0
         ))
         .retrieve()
+        .onStatus(HttpStatusCode::isError, resp -> resp.createException().flatMap(e -> {
+         log.error("OpenAI error {}: {}", resp.statusCode(), e.getMessage());
+         return reactor.core.publisher.Mono.error(e);
+        }))
         .bodyToMono(String.class)
         .block();
 
-   if (response == null) {
-    log.error("OpenAI returned null response for dish: {}", dishName);
-    return fallbackResponse(dishName, "Empty response from OpenAI");
+   if (raw == null) {
+    return fallback("Unknown", "Empty response from OpenAI");
    }
 
-   JsonNode root = objectMapper.readTree(response);
-   JsonNode contentNode = root.at("/choices/0/message/content");
-   if (contentNode.isMissingNode()) {
-    log.error("No content found in OpenAI response for dish: {}", dishName);
-    return fallbackResponse(dishName, "Invalid OpenAI response format");
+   // Extract the JSON array robustly
+   List<String> ingredientsList = extractStringArrayFromResponse(raw);
+   List<Ingredient> ingredients = new ArrayList<>();
+   double total = 0.0;
+
+   for (String s : ingredientsList) {
+    String name = s.toLowerCase().trim();
+    if (name.isEmpty()) continue;
+    double kg = CARBON_DB.getOrDefault(name, 0.5);
+    total += kg;
+    ingredients.add(new Ingredient(capitalize(name), round1(kg)));
    }
 
-   String content = contentNode.asText().trim();
-   JsonNode arrayNode = objectMapper.readTree(content);
+   return new CarbonEstimateResponse(capitalize(dishName), round1(total), ingredients, null);
 
-   List<Map<String, Object>> ingredients = new ArrayList<>();
-   double totalCarbon = 0.0;
-
-   if (arrayNode.isArray()) {
-    for (JsonNode node : arrayNode) {
-     String name = node.asText().toLowerCase().trim();
-     if (name.isEmpty()) continue;
-
-     double carbonKg = CARBON_DB.getOrDefault(name, 0.5);
-     totalCarbon += carbonKg;
-
-     Map<String, Object> ingredient = new HashMap<>();
-     ingredient.put("name", capitalize(name));
-     ingredient.put("carbon_kg", Math.round(carbonKg * 10.0) / 10.0);
-     ingredients.add(ingredient);
-    }
-   } else {
-    log.warn("LLM did not return a valid JSON array for dish: {}", dishName);
-   }
-
-   Map<String, Object> result = new HashMap<>();
-   result.put("dish", capitalize(dishName));
-   result.put("estimated_carbon_kg", Math.round(totalCarbon * 10.0) / 10.0);
-   result.put("ingredients", ingredients);
-
-   log.info("Successfully estimated carbon footprint for '{}': {} kg CO₂", dishName, result.get("estimated_carbon_kg"));
-   return result;
-
+  } catch (WebClientResponseException wcre) {
+   log.error("OpenAI HTTP {}: {}", wcre.getStatusCode(), wcre.getResponseBodyAsString(), wcre);
+   return fallback(dishName, "OpenAI HTTP " + wcre.getStatusCode().value());
   } catch (Exception e) {
-   log.error("Failed to estimate carbon footprint for dish: {}", dishName, e);
-   return fallbackResponse(dishName, e.getMessage());
+   log.error("Failed to estimate from dish name: {}", dishName, e);
+   return fallback(dishName, e.getMessage());
   }
  }
 
-
- public Map<String, Object> estimateFromImage(byte[] imageBytes, String mimeType) {
+ public CarbonEstimateResponse estimateFromImage(byte[] imageBytes, String mimeType) {
   if (imageBytes == null || imageBytes.length == 0) {
-   log.warn("Received empty image data");
-   return fallbackResponse("Unknown Dish", "Empty image uploaded");
+   return fallback("Unknown Dish", "Empty image uploaded");
   }
 
-
   if (mimeType == null || !mimeType.startsWith("image/")) {
-   log.info("MIME type not provided or invalid. Defaulting to image/jpeg");
+   // Controller already passes detected content-type. Still keep a safe default.
    mimeType = "image/jpeg";
   }
 
-  String base64Image = Base64.getEncoder().encodeToString(imageBytes);
-  String dataUri = "data:" + mimeType + ";base64," + base64Image;
+  String base64 = Base64.getEncoder().encodeToString(imageBytes);
+  String dataUri = "data:" + mimeType + ";base64," + base64;
 
-  String content = String.format(
-       "[{\"type\": \"text\", \"text\": \"What food is this? Respond only with the dish name.\"}," +
-            "{\"type\": \"image_url\", \"image_url\": {\"url\": \"%s\"}}]",
-       dataUri
+  // Use multimodal content format
+  var userContent = List.of(
+       Map.of("type", "text", "text", "Identify the dish in the image. Reply with ONLY the dish name."),
+       Map.of("type", "image_url", "image_url", Map.of("url", dataUri))
   );
 
   try {
-   log.info("Sending image to GPT-4 Vision for dish identification");
+   log.info("Sending image to {} for dish identification", visionModel);
 
-   String response = openAIClient.post()
+   String raw = openAIClient.post()
         .uri("/chat/completions")
         .bodyValue(Map.of(
-             "model", "gpt-4o",
-             "messages", List.of(
-                  Map.of("role", "user", "content", content)
-             ),
-             "max_tokens", 100
+             "model", visionModel,
+             "messages", List.of(Map.of("role", "user", "content", userContent)),
+             "max_tokens", 50,
+             "temperature", 0
         ))
         .retrieve()
+        .onStatus(HttpStatusCode::isError, resp -> resp.createException().flatMap(e -> {
+         log.error("OpenAI Vision error {}: {}", resp.statusCode(), e.getMessage());
+         return reactor.core.publisher.Mono.error(e);
+        }))
         .bodyToMono(String.class)
         .block();
 
-   if (response == null) {
-    log.error("GPT-4 Vision returned null response");
-    return fallbackResponse("Unknown Dish", "Empty response from vision model");
+   if (raw == null) {
+    return fallback("Unknown Dish", "Empty response from vision model");
    }
 
-   JsonNode root = objectMapper.readTree(response);
-   JsonNode contentNode = root.at("/choices/0/message/content");
-   if (contentNode.isMissingNode()) {
-    log.error("No content found in GPT-4 Vision response");
-    return fallbackResponse("Unknown Dish", "Invalid vision response format");
+   String dishName = readMessageContent(raw).trim();
+   if (dishName.isEmpty()) {
+    return fallback("Unknown Dish", "Vision model returned empty dish name");
    }
-
-   String dishName = contentNode.asText().trim();
-   log.info("GPT-4 Vision identified dish: {}", dishName);
    return estimateFromDishName(dishName);
 
+  } catch (WebClientResponseException wcre) {
+   log.error("OpenAI Vision HTTP {}: {}", wcre.getStatusCode(), wcre.getResponseBodyAsString(), wcre);
+   return fallback("Unknown Dish", "OpenAI Vision HTTP " + wcre.getStatusCode().value());
   } catch (Exception e) {
-   log.error("Failed to process image with GPT-4 Vision", e);
-   return fallbackResponse("Unknown Dish", e.getMessage());
+   log.error("Failed to process image", e);
+   return fallback("Unknown Dish", e.getMessage());
   }
  }
 
+ // ---------- Helpers ----------
 
- private String capitalize(String word) {
-  if (word == null || word.isEmpty()) return word;
-  return word.substring(0, 1).toUpperCase() + word.substring(1).toLowerCase();
+ private List<String> extractStringArrayFromResponse(String raw) throws Exception {
+  // 1) Parse whole JSON and try to navigate to the content
+  JsonNode root = objectMapper.readTree(raw);
+  JsonNode contentNode = root.at("/choices/0/message/content");
+
+  if (!contentNode.isMissingNode()) {
+   String content = contentNode.asText();
+   List<String> arr = tryParseStringArray(content);
+   if (!arr.isEmpty()) return arr;
+  }
+
+  // 2) As a fallback, regex the first [...] block and parse it
+  String rawText = contentNode.isMissingNode() ? raw : contentNode.asText();
+  Pattern p = Pattern.compile("\\[(?s).*?\\]");
+  Matcher m = p.matcher(rawText);
+  if (m.find()) {
+   String arrayText = m.group();
+   List<String> arr = tryParseStringArray(arrayText);
+   if (!arr.isEmpty()) return arr;
+  }
+
+  // 3) Last resort: make a single-item guess to avoid hard failure
+  return List.of("rice");
  }
 
+ private List<String> tryParseStringArray(String json) {
+  try {
+   JsonNode node = objectMapper.readTree(json);
+   if (node.isArray()) {
+    return objectMapper.convertValue(node, new TypeReference<List<String>>() {});
+   }
+  } catch (Exception ignored) {}
+  return Collections.emptyList();
+ }
 
- private Map<String, Object> fallbackResponse(String dish, String error) {
-  List<Map<String, Object>> ingredients = List.of(
-       Map.of("name", "Unknown", "carbon_kg", 1.0)
+ private String readMessageContent(String raw) throws Exception {
+  JsonNode root = objectMapper.readTree(raw);
+  JsonNode contentNode = root.at("/choices/0/message/content");
+  return contentNode.isMissingNode() ? "" : contentNode.asText();
+ }
+
+ private CarbonEstimateResponse fallback(String dish, String error) {
+  return new CarbonEstimateResponse(
+       capitalize(dish),
+       1.0,
+       List.of(new Ingredient("Unknown", 1.0)),
+       error == null ? "Unknown error" : error
   );
-  Map<String, Object> result = new HashMap<>();
-  result.put("dish", dish);
-  result.put("estimated_carbon_kg", 1.0);
-  result.put("ingredients", ingredients);
-  result.put("error", error != null ? error : "Unknown error");
-  return result;
  }
 
+ private String capitalize(String s) {
+  if (s == null || s.isEmpty()) return s;
+  return s.substring(0, 1).toUpperCase() + s.substring(1).toLowerCase();
+ }
 
- private Map<String, Object> fallbackResponse(String dish) {
-  return fallbackResponse(dish, null);
+ private double round1(double v) {
+  return Math.round(v * 10.0) / 10.0;
  }
 }
