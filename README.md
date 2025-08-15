@@ -258,10 +258,3 @@ curl -X POST http://localhost:8080/api/estimate/image \
 4. Ensure all tests pass
 5. Submit a pull request
 
-## License
-
-[Add your license information here]
-
----
-
-**Note**: This is a prototype implementation. Carbon footprint values are approximations and should not be used for official environmental reporting.
